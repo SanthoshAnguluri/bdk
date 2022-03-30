@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Signing Taproot PSBTs (key spend and script spend)
   - Support for `tr()` descriptors in the `descriptor!()` macro
 - Add support for Bitcoin Core 23.0 when using the `rpc` blockchain
+- Transaction nlocktime defaults to `current_height`, which can be specified through `TxParams` - if not specified, the last sync height is used
 
 ## [v0.18.0] - [v0.17.0]
 
