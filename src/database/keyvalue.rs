@@ -419,7 +419,6 @@ impl BatchDatabase for Tree {
     }
 }
 
-
 #[cfg(test)]
 mod test {
     use lazy_static::lazy_static;
@@ -428,7 +427,7 @@ mod test {
 
     use sled::{Db, Tree};
 
-    use crate::make_tests;
+    use crate::run_tests_with_init;
 
     static mut COUNT: usize = 0;
 
@@ -467,9 +466,9 @@ mod test {
                 .unwrap()
         }
     }
-    
-    make_tests![
-        @getter get_tree(),
+
+    run_tests_with_init![
+        @init get_tree(),
         @tests(
             test_script_pubkey,
             test_batch_script_pubkey,

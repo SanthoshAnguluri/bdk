@@ -479,10 +479,9 @@ impl ConfigurableDatabase for MemoryDatabase {
     }
 }
 
-
 #[cfg(test)]
 mod test {
-    use crate::make_tests;
+    use crate::run_tests_with_init;
 
     use super::MemoryDatabase;
 
@@ -490,8 +489,8 @@ mod test {
         MemoryDatabase::new()
     }
 
-    make_tests![
-        @getter get_tree(),
+    run_tests_with_init![
+        @init get_tree(),
         @tests(
             test_script_pubkey,
             test_batch_script_pubkey,
