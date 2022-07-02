@@ -5,6 +5,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- New MSRV set to `1.56.1`
+- Fee sniping discouraging through nLockTime - if the user specifies a `current_height`, we use that as a nlocktime, otherwise we use the last sync height (or 0 if we never synced)
+
+## [v0.19.0] - [v0.18.0]
 
 - added `OldestFirstCoinSelection` impl to `CoinSelectionAlgorithm`
 - New MSRV set to `1.56`
@@ -12,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add traits to reuse `Blockchain`s across multiple wallets (`BlockchainFactory` and `StatelessBlockchain`).
 - Upgrade to rust-bitcoin `0.28`
 - If using the `sqlite-db` feature all cached wallet data is deleted due to a possible UTXO inconsistency, a wallet.sync will recreate it  
+- Update `PkOrF` in the policy module to become an enum
+- Add experimental support for Taproot, including:
+  - Support for `tr()` descriptors with complex tapscript trees
+  - Creation of Taproot PSBTs (BIP-371)
+  - Signing Taproot PSBTs (key spend and script spend)
+  - Support for `tr()` descriptors in the `descriptor!()` macro
+- Add support for Bitcoin Core 23.0 when using the `rpc` blockchain
 - Transaction nlocktime defaults to `current_height`, which can be specified through `TxParams` - if not specified, the last sync height is used
 
 ## [v0.18.0] - [v0.17.0]
@@ -456,4 +467,5 @@ final transaction is created by calling `finish` on the builder.
 [v0.16.1]: https://github.com/bitcoindevkit/bdk/compare/v0.16.0...v0.16.1
 [v0.17.0]: https://github.com/bitcoindevkit/bdk/compare/v0.16.1...v0.17.0
 [v0.18.0]: https://github.com/bitcoindevkit/bdk/compare/v0.17.0...v0.18.0
-[unreleased]: https://github.com/bitcoindevkit/bdk/compare/v0.18.0...HEAD
+[v0.19.0]: https://github.com/bitcoindevkit/bdk/compare/v0.18.0...v0.19.0
+[unreleased]: https://github.com/bitcoindevkit/bdk/compare/v0.19.0...HEAD

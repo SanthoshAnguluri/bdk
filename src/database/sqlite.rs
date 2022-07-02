@@ -400,7 +400,7 @@ impl SqliteDatabase {
             let sent: u64 = row.get(3)?;
             let fee: Option<u64> = row.get(4)?;
             let height: Option<u32> = row.get(5)?;
-            let raw_tx: Option<Vec<u8>> = row.get(7)?;
+            let raw_tx: Option<Vec<u8>> = row.get(6)?;
             let tx: Option<Transaction> = match raw_tx {
                 Some(raw_tx) => {
                     let tx: Transaction = deserialize(&raw_tx)?;
@@ -976,7 +976,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
 #[cfg(test)]
 pub mod test {
-    use crate::{database::SqliteDatabase, make_tests};
+    use crate::{database::SqliteDatabase, run_tests_with_init};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn get_database() -> SqliteDatabase {
@@ -986,8 +986,8 @@ pub mod test {
         SqliteDatabase::new(String::from(dir.to_str().unwrap()))
     }
 
-    make_tests![
-        @getter get_database(),
+    run_tests_with_init![
+        @init get_database(),
         @tests(
             test_script_pubkey,
             test_batch_script_pubkey,

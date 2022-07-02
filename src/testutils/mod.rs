@@ -14,6 +14,8 @@
 #[cfg(feature = "test-blockchains")]
 pub mod blockchain_tests;
 
+pub mod helpers;
+
 use bitcoin::{Address, Txid};
 
 #[derive(Clone, Debug)]

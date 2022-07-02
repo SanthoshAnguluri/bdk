@@ -23,13 +23,15 @@ use std::sync::Arc;
 use bitcoin::secp256k1::Secp256k1;
 
 use bitcoin::consensus::encode::serialize;
-use bitcoin::util::psbt;
+use bitcoin::util::{psbt, taproot};
 use bitcoin::{
-    Address, EcdsaSighashType, Network, OutPoint, Script, Transaction, TxOut, Txid, Witness,
+    Address, EcdsaSighashType, Network, OutPoint, SchnorrSighashType, Script, Transaction, TxOut,
+    Txid, Witness,
 };
 
 use miniscript::descriptor::DescriptorTrait;
 use miniscript::psbt::PsbtInputSatisfier;
+use miniscript::ToPublicKey;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -49,7 +51,7 @@ pub use utils::IsDust;
 
 use address_validator::AddressValidator;
 use coin_selection::DefaultCoinSelectionAlgorithm;
-use signer::{SignOptions, Signer, SignerOrdering, SignersContainer};
+use signer::{SignOptions, SignerOrdering, SignersContainer, TransactionSigner};
 use tx_builder::{BumpFee, CreateTx, FeePolicy, TxBuilder, TxParams};
 use utils::{check_nlocktime, check_nsequence_rbf, After, Older, SecpCtx};
 
@@ -77,10 +79,10 @@ const COINBASE_MATURITY: u32 = 100;
 ///
 /// 1. output *descriptors* from which it can derive addresses.
 /// 2. A [`Database`] where it tracks transactions and utxos related to the descriptors.
-/// 3. [`Signer`]s that can contribute signatures to addresses instantiated from the descriptors.
+/// 3. [`signer`]s that can contribute signatures to addresses instantiated from the descriptors.
 ///
 /// [`Database`]: crate::database::Database
-/// [`Signer`]: crate::signer::Signer
+/// [`signer`]: crate::signer
 #[derive(Debug)]
 pub struct Wallet<D> {
     descriptor: ExtendedDescriptor,
@@ -195,7 +197,7 @@ where
             KeychainKind::External,
             get_checksum(&descriptor.to_string())?.as_bytes(),
         )?;
-        let signers = Arc::new(SignersContainer::from(keymap));
+        let signers = Arc::new(SignersContainer::build(keymap, &descriptor, &secp));
         let (change_descriptor, change_signers) = match change_descriptor {
             Some(desc) => {
                 let (change_descriptor, change_keymap) =
@@ -205,7 +207,11 @@ where
                     get_checksum(&change_descriptor.to_string())?.as_bytes(),
                 )?;
 
-                let change_signers = Arc::new(SignersContainer::from(change_keymap));
+                let change_signers = Arc::new(SignersContainer::build(
+                    change_keymap,
+                    &change_descriptor,
+                    &secp,
+                ));
                 // if !parsed.same_structure(descriptor.as_ref()) {
                 //     return Err(Error::DifferentDescriptorStructure);
                 // }
@@ -455,7 +461,7 @@ where
         &mut self,
         keychain: KeychainKind,
         ordering: SignerOrdering,
-        signer: Arc<dyn Signer>,
+        signer: Arc<dyn TransactionSigner>,
     ) {
         let signers = match keychain {
             KeychainKind::External => Arc::make_mut(&mut self.signers),
@@ -611,13 +617,15 @@ where
             _ => 1,
         };
 
-        let last_sync_height = self
-            .database()
-            .get_sync_time()?
-            .map(|sync_time| sync_time.block_time.height);
-
-        // If they didn't tell us the current height, we assume it's the latest sync height.
-        let current_height = params.current_height.or(last_sync_height);
+        // We use a match here instead of a map_or_else as it's way more readable :)
+        let current_height = match params.current_height {
+            // If they didn't tell us the current height, we assume it's the latest sync height.
+            None => self
+                .database()
+                .get_sync_time()?
+                .map(|sync_time| sync_time.block_time.height),
+            h => h,
+        };
 
         let lock_time = match params.locktime {
             // When no nLockTime is specified, we try to prevent fee sniping, if possible
@@ -626,7 +634,7 @@ where
                 // to current_height. If we don't know the current_height,
                 // we default to 0.
                 let fee_sniping_height = current_height.unwrap_or(0);
-                // We choose the bigger between the required height and the fee sniping
+                // We choose the biggest between the required nlocktime and the fee sniping
                 // height
                 std::cmp::max(requirements.timelock.unwrap_or(0), fee_sniping_height)
             }
@@ -800,7 +808,14 @@ where
         let drain_val = (coin_selection.selected_amount() - outgoing).saturating_sub(fee_amount);
 
         if tx.output.is_empty() {
-            if params.drain_to.is_some() {
+            // Uh oh, our transaction has no outputs.
+            // We allow this when:
+            // - We have a drain_to address and the utxos we must spend (this happens,
+            // for example, when we RBF)
+            // - We have a drain_to address and drain_wallet set
+            // Otherwise, we don't know who we should send the funds to, and how much
+            // we should send!
+            if params.drain_to.is_some() && (params.drain_wallet || !params.utxos.is_empty()) {
                 if drain_val.is_dust(&drain_output.script_pubkey) {
                     return Err(Error::InsufficientFunds {
                         needed: drain_output.script_pubkey.dust_value().as_sat(),
@@ -1023,23 +1038,27 @@ where
         // this helps us doing our job later
         self.add_input_hd_keypaths(psbt)?;
 
-        // If we aren't allowed to use `witness_utxo`, ensure that every input but finalized one
+        // If we aren't allowed to use `witness_utxo`, ensure that every input (except p2tr and finalized ones)
         // has the `non_witness_utxo`
         if !sign_options.trust_witness_utxo
             && psbt
                 .inputs
                 .iter()
                 .filter(|i| i.final_script_witness.is_none() && i.final_script_sig.is_none())
+                .filter(|i| i.tap_internal_key.is_none() && i.tap_merkle_root.is_none())
                 .any(|i| i.non_witness_utxo.is_none())
         {
             return Err(Error::Signer(signer::SignerError::MissingNonWitnessUtxo));
         }
 
         // If the user hasn't explicitly opted-in, refuse to sign the transaction unless every input
-        // is using `SIGHASH_ALL`
+        // is using `SIGHASH_ALL` or `SIGHASH_DEFAULT` for taproot
         if !sign_options.allow_all_sighashes
             && !psbt.inputs.iter().all(|i| {
-                i.sighash_type.is_none() || i.sighash_type == Some(EcdsaSighashType::All.into())
+                i.sighash_type.is_none()
+                    || i.sighash_type == Some(EcdsaSighashType::All.into())
+                    || i.sighash_type == Some(SchnorrSighashType::All.into())
+                    || i.sighash_type == Some(SchnorrSighashType::Default.into())
             })
         {
             return Err(Error::Signer(signer::SignerError::NonStandardSighash));
@@ -1051,13 +1070,7 @@ where
             .iter()
             .chain(self.change_signers.signers().iter())
         {
-            if signer.sign_whole_tx() {
-                signer.sign(psbt, None, &self.secp)?;
-            } else {
-                for index in 0..psbt.inputs.len() {
-                    signer.sign(psbt, Some(index), &self.secp)?;
-                }
-            }
+            signer.sign_transaction(psbt, &self.secp)?;
         }
 
         // attempt to finalize
@@ -1242,7 +1255,7 @@ where
 
         let derived_descriptor = descriptor.as_derived(index, &self.secp);
 
-        let hd_keypaths = derived_descriptor.get_hd_keypaths(&self.secp)?;
+        let hd_keypaths = derived_descriptor.get_hd_keypaths(&self.secp);
         let script = derived_descriptor.script_pubkey();
 
         for validator in &self.address_validators {
@@ -1474,7 +1487,15 @@ where
                     psbt_input: foreign_psbt_input,
                     outpoint,
                 } => {
-                    if !params.only_witness_utxo && foreign_psbt_input.non_witness_utxo.is_none() {
+                    let is_taproot = foreign_psbt_input
+                        .witness_utxo
+                        .as_ref()
+                        .map(|txout| txout.script_pubkey.is_v1_p2tr())
+                        .unwrap_or(false);
+                    if !is_taproot
+                        && !params.only_witness_utxo
+                        && foreign_psbt_input.non_witness_utxo.is_none()
+                    {
                         return Err(Error::Generic(format!(
                             "Missing non_witness_utxo on foreign utxo {}",
                             outpoint
@@ -1499,7 +1520,32 @@ where
                 let (desc, _) = self._get_descriptor_for_keychain(keychain);
                 let derived_descriptor = desc.as_derived(child, &self.secp);
 
-                psbt_output.bip32_derivation = derived_descriptor.get_hd_keypaths(&self.secp)?;
+                if let miniscript::Descriptor::Tr(tr) = &derived_descriptor {
+                    let tap_tree = if tr.taptree().is_some() {
+                        let mut builder = taproot::TaprootBuilder::new();
+                        for (depth, ms) in tr.iter_scripts() {
+                            let script = ms.encode();
+                            builder = builder.add_leaf(depth, script).expect(
+                                "Computing spend data on a valid Tree should always succeed",
+                            );
+                        }
+                        Some(
+                            psbt::TapTree::from_builder(builder)
+                                .expect("The tree should always be valid"),
+                        )
+                    } else {
+                        None
+                    };
+                    psbt_output.tap_tree = tap_tree;
+                    psbt_output
+                        .tap_key_origins
+                        .append(&mut derived_descriptor.get_tap_key_origins(&self.secp));
+                    psbt_output.tap_internal_key = Some(tr.internal_key().to_x_only_pubkey());
+                } else {
+                    psbt_output
+                        .bip32_derivation
+                        .append(&mut derived_descriptor.get_hd_keypaths(&self.secp));
+                }
                 if params.include_output_redeem_witness_script {
                     psbt_output.witness_script = derived_descriptor.psbt_witness_script();
                     psbt_output.redeem_script = derived_descriptor.psbt_redeem_script();
@@ -1532,17 +1578,35 @@ where
 
         let desc = self.get_descriptor_for_keychain(keychain);
         let derived_descriptor = desc.as_derived(child, &self.secp);
-        psbt_input.bip32_derivation = derived_descriptor.get_hd_keypaths(&self.secp)?;
+
+        if let miniscript::Descriptor::Tr(tr) = &derived_descriptor {
+            psbt_input.tap_key_origins = derived_descriptor.get_tap_key_origins(&self.secp);
+            psbt_input.tap_internal_key = Some(tr.internal_key().to_x_only_pubkey());
+
+            let spend_info = tr.spend_info();
+            psbt_input.tap_merkle_root = spend_info.merkle_root();
+            psbt_input.tap_scripts = spend_info
+                .as_script_map()
+                .keys()
+                .filter_map(|script_ver| {
+                    spend_info
+                        .control_block(script_ver)
+                        .map(|cb| (cb, script_ver.clone()))
+                })
+                .collect();
+        } else {
+            psbt_input.bip32_derivation = derived_descriptor.get_hd_keypaths(&self.secp);
+        }
 
         psbt_input.redeem_script = derived_descriptor.psbt_redeem_script();
         psbt_input.witness_script = derived_descriptor.psbt_witness_script();
 
         let prev_output = utxo.outpoint;
         if let Some(prev_tx) = self.database.borrow().get_raw_tx(&prev_output.txid)? {
-            if desc.is_witness() {
+            if desc.is_witness() || desc.is_taproot() {
                 psbt_input.witness_utxo = Some(prev_tx.output[prev_output.vout as usize].clone());
             }
-            if !desc.is_witness() || !only_witness_utxo {
+            if !desc.is_taproot() && (!desc.is_witness() || !only_witness_utxo) {
                 psbt_input.non_witness_utxo = Some(prev_tx);
             }
         }
@@ -1568,12 +1632,19 @@ where
                 {
                     debug!("Found descriptor {:?}/{}", keychain, child);
 
-                    // merge hd_keypaths
+                    // merge hd_keypaths or tap_key_origins
                     let desc = self.get_descriptor_for_keychain(keychain);
-                    let mut hd_keypaths = desc
-                        .as_derived(child, &self.secp)
-                        .get_hd_keypaths(&self.secp)?;
-                    psbt_input.bip32_derivation.append(&mut hd_keypaths);
+                    if desc.is_taproot() {
+                        let mut tap_key_origins = desc
+                            .as_derived(child, &self.secp)
+                            .get_tap_key_origins(&self.secp);
+                        psbt_input.tap_key_origins.append(&mut tap_key_origins);
+                    } else {
+                        let mut hd_keypaths = desc
+                            .as_derived(child, &self.secp)
+                            .get_hd_keypaths(&self.secp);
+                        psbt_input.bip32_derivation.append(&mut hd_keypaths);
+                    }
                 }
             }
         }
@@ -1796,6 +1867,26 @@ pub(crate) mod test {
         "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))"
     }
 
+    pub(crate) fn get_test_tr_single_sig() -> &'static str {
+        "tr(cNJmN3fH9DDbDt131fQNkVakkpzawJBSeybCUNmP1BovpmGQ45xG)"
+    }
+
+    pub(crate) fn get_test_tr_with_taptree() -> &'static str {
+        "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{pk(cPZzKuNmpuUjD1e8jUU4PVzy2b5LngbSip8mBsxf4e7rSFZVb4Uh),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
+    }
+
+    pub(crate) fn get_test_tr_repeated_key() -> &'static str {
+        "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100)),and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(200))})"
+    }
+
+    pub(crate) fn get_test_tr_single_sig_xprv() -> &'static str {
+        "tr(tprv8ZgxMBicQKsPdDArR4xSAECuVxeX1jwwSXR4ApKbkYgZiziDc4LdBy2WvJeGDfUSE4UT4hHhbgEwbdq8ajjUHiKDegkwrNU6V55CxcxonVN/*)"
+    }
+
+    pub(crate) fn get_test_tr_with_taptree_xprv() -> &'static str {
+        "tr(b511bd5771e47ee27558b1765e87b541668304ec567721c7b880edc0a010da55,{pk(tprv8ZgxMBicQKsPdDArR4xSAECuVxeX1jwwSXR4ApKbkYgZiziDc4LdBy2WvJeGDfUSE4UT4hHhbgEwbdq8ajjUHiKDegkwrNU6V55CxcxonVN/*),pk(8aee2b8120a5f157f1223f72b5e62b825831a27a9fdf427db7cc697494d4a642)})"
+    }
+
     macro_rules! assert_fee_rate {
         ($tx:expr, $fees:expr, $fee_rate:expr $( ,@dust_change $( $dust_change:expr )* )* $( ,@add_signature $( $add_signature:expr )* )* ) => ({
             let mut tx = $tx.clone();
@@ -1823,6 +1914,17 @@ pub(crate) mod test {
                 assert!(tx_fee_rate >= fee_rate, "Expected fee rate of at least {:?}, the tx has {:?}", fee_rate, tx_fee_rate);
             }
         });
+    }
+
+    macro_rules! from_str {
+        ($e:expr, $t:ty) => {{
+            use std::str::FromStr;
+            <$t>::from_str($e).unwrap()
+        }};
+
+        ($e:expr) => {
+            from_str!($e, _)
+        };
     }
 
     #[test]
@@ -2139,6 +2241,40 @@ pub(crate) mod test {
             .unwrap();
         assert_eq!(main_output.value, 20_000,);
         assert_eq!(drain_output.value, 30_000 - details.fee.unwrap_or(0));
+    }
+
+    #[test]
+    fn test_create_tx_drain_to_and_utxos() {
+        let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        let addr = wallet.get_address(New).unwrap();
+        let utxos: Vec<_> = wallet
+            .get_available_utxos()
+            .unwrap()
+            .into_iter()
+            .map(|(u, _)| u.outpoint)
+            .collect();
+        let mut builder = wallet.build_tx();
+        builder
+            .drain_to(addr.script_pubkey())
+            .add_utxos(&utxos)
+            .unwrap();
+        let (psbt, details) = builder.finish().unwrap();
+
+        assert_eq!(psbt.unsigned_tx.output.len(), 1);
+        assert_eq!(
+            psbt.unsigned_tx.output[0].value,
+            50_000 - details.fee.unwrap_or(0)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "NoRecipients")]
+    fn test_create_tx_drain_to_no_drain_wallet_no_utxos() {
+        let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        let drain_addr = wallet.get_address(New).unwrap();
+        let mut builder = wallet.build_tx();
+        builder.drain_to(drain_addr.script_pubkey());
+        builder.finish().unwrap();
     }
 
     #[test]
