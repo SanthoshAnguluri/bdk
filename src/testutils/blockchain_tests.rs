@@ -4,7 +4,7 @@ use bitcoin::hashes::hex::{FromHex, ToHex};
 use bitcoin::hashes::sha256d;
 use bitcoin::{Address, Amount, Script, Transaction, Txid, Witness};
 pub use bitcoincore_rpc::bitcoincore_rpc_json::AddressType;
-pub use bitcoincore_rpc::{Auth, Client as RpcClient, RpcApi};
+pub use bitcoincore_rpc::{Client as RpcClient, RpcApi};
 use core::str::FromStr;
 use electrsd::bitcoind::BitcoinD;
 use electrsd::{bitcoind, ElectrsD};
@@ -356,6 +356,194 @@ where
 
         std::thread::sleep(delay);
     }
+}
+
+use crate::blockchain::AnyBlockchain;
+
+#[allow(dead_code)]
+pub enum BlockchainType {
+    #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
+    RpcBlockchain,
+    #[cfg(feature = "test-esplora")]
+    EsploraBlockchain,
+}
+
+#[cfg(test)]
+pub mod test {
+    use std::any::Any;
+
+    use crate::bitcoin::{Network, Transaction};
+    #[cfg(feature = "test-esplora")]
+    use crate::blockchain::EsploraBlockchain;
+    #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
+    use crate::blockchain::{rpc::Auth, ConfigurableBlockchain, RpcBlockchain, RpcConfig};
+    use crate::database::MemoryDatabase;
+    use crate::testutils;
+    use crate::testutils::blockchain_tests::TestClient;
+    use crate::types::KeychainKind;
+    use crate::{FeeRate, SyncOptions, Wallet};
+
+    use super::*;
+
+    fn get_wallet_from_descriptors(
+        descriptors: &(String, Option<String>),
+    ) -> Wallet<MemoryDatabase> {
+        Wallet::new(
+            &descriptors.0.to_string(),
+            descriptors.1.as_ref(),
+            Network::Regtest,
+            MemoryDatabase::new(),
+        )
+        .unwrap()
+    }
+
+    #[allow(dead_code)]
+    enum WalletType {
+        WpkhSingleSig,
+        TaprootKeySpend,
+        TaprootScriptSpend,
+        TaprootScriptSpend2,
+        TaprootScriptSpend3,
+    }
+
+    fn init_wallet(
+        ty: WalletType,
+        chain_type: BlockchainType,
+    ) -> (
+        Wallet<MemoryDatabase>,
+        AnyBlockchain,
+        (String, Option<String>),
+        TestClient,
+    ) {
+        let _ = env_logger::try_init();
+
+        let descriptors = match ty {
+            WalletType::WpkhSingleSig => testutils! {
+                @descriptors ( "wpkh(Alice)" ) ( "wpkh(Alice)" ) ( @keys ( "Alice" => (@generate_xprv "/44'/0'/0'/0/*", "/44'/0'/0'/1/*") ) )
+            },
+            WalletType::TaprootKeySpend => testutils! {
+                @descriptors ( "tr(Alice)" ) ( "tr(Alice)" ) ( @keys ( "Alice" => (@generate_xprv "/44'/0'/0'/0/*", "/44'/0'/0'/1/*") ) )
+            },
+            WalletType::TaprootScriptSpend => testutils! {
+                @descriptors ( "tr(Key,and_v(v:pk(Script),older(6)))" ) ( "tr(Key,and_v(v:pk(Script),older(6)))" ) ( @keys ( "Key" => (@literal "30e14486f993d5a2d222770e97286c56cec5af115e1fb2e0065f476a0fcf8788"), "Script" => (@generate_xprv "/0/*", "/1/*") ) )
+            },
+            WalletType::TaprootScriptSpend2 => testutils! {
+                @descriptors ( "tr(Alice,pk(Bob))" ) ( "tr(Alice,pk(Bob))" ) ( @keys ( "Alice" => (@literal "30e14486f993d5a2d222770e97286c56cec5af115e1fb2e0065f476a0fcf8788"), "Bob" => (@generate_xprv "/0/*", "/1/*") ) )
+            },
+            WalletType::TaprootScriptSpend3 => testutils! {
+                @descriptors ( "tr(Alice,{pk(Bob),pk(Carol)})" ) ( "tr(Alice,{pk(Bob),pk(Carol)})" ) ( @keys ( "Alice" => (@literal "30e14486f993d5a2d222770e97286c56cec5af115e1fb2e0065f476a0fcf8788"), "Bob" => (@generate_xprv "/0/*", "/1/*"), "Carol" => (@generate_xprv "/0/*", "/1/*") ) )
+            },
+        };
+
+        let test_client = TestClient::default();
+        let blockchain: AnyBlockchain = match chain_type {
+            #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
+            BlockchainType::RpcBlockchain => {
+                let config = RpcConfig {
+                    url: test_client.bitcoind.rpc_url(),
+                    auth: Auth::Cookie {
+                        file: test_client.bitcoind.params.cookie_file.clone(),
+                    },
+                    network: Network::Regtest,
+                    wallet_name: format!(
+                        "client-wallet-test-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos()
+                    ),
+                    skip_blocks: None,
+                };
+                AnyBlockchain::Rpc(Box::new(RpcBlockchain::from_config(&config).unwrap()))
+            }
+
+            #[cfg(feature = "test-esplora")]
+            BlockchainType::EsploraBlockchain => {
+                AnyBlockchain::Esplora(Box::new(EsploraBlockchain::new(
+                    &format!(
+                        "http://{}",
+                        test_client.electrsd.esplora_url.as_ref().unwrap()
+                    ),
+                    20,
+                )))
+            }
+        };
+        let wallet = get_wallet_from_descriptors(&descriptors);
+
+        // rpc need to call import_multi before receiving any tx, otherwise will not see tx in the mempool
+        #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        (wallet, blockchain, descriptors, test_client)
+    }
+
+    fn init_single_sig(
+        chain_type: BlockchainType,
+    ) -> (
+        Wallet<MemoryDatabase>,
+        AnyBlockchain,
+        (String, Option<String>),
+        TestClient,
+    ) {
+        init_wallet(WalletType::WpkhSingleSig, chain_type)
+    }
+
+    pub fn test_sync_simple(chain_type: BlockchainType) {
+        use crate::database::Database;
+        use std::ops::Deref;
+
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+
+        let tx = testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        };
+        println!("{:?}", tx);
+        let txid = test_client.receive(tx);
+
+        // the RPC blockchain needs to call `sync()` during initialization to import the
+        // addresses (see `init_single_sig()`), so we skip this assertion
+        #[cfg(not(any(feature = "test-rpc", feature = "test-rpc-legacy")))]
+        assert!(
+            wallet.database().deref().get_sync_time().unwrap().is_none(),
+            "initial sync_time not none"
+        );
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert!(
+            wallet.database().deref().get_sync_time().unwrap().is_some(),
+            "sync_time hasn't been updated"
+        );
+
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+        assert_eq!(
+            wallet.list_unspent().unwrap()[0].keychain,
+            KeychainKind::External,
+            "incorrect keychain kind"
+        );
+
+        let list_tx_item = &wallet.list_transactions(false).unwrap()[0];
+        assert_eq!(list_tx_item.txid, txid, "incorrect txid");
+        assert_eq!(list_tx_item.received, 50_000, "incorrect received");
+        assert_eq!(list_tx_item.sent, 0, "incorrect sent");
+        assert_eq!(
+            list_tx_item.confirmation_time, None,
+            "incorrect confirmation time"
+        );
+    }
+}
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! make_blockchain_tests {
+    (@type $chain_type:expr, @tests ( $($x:tt) , + $(,)? )) => {
+        $(
+          #[test]
+          fn $x()
+          {
+            $crate::testutils::blockchain_tests::test::$x($chain_type);
+          }
+        )+
+    };
 }
 
 /// This macro runs blockchain tests against a `Blockchain` implementation. It requires access to a
