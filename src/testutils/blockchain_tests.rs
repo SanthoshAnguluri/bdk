@@ -366,6 +366,8 @@ pub enum BlockchainType {
     RpcBlockchain,
     #[cfg(feature = "test-esplora")]
     EsploraBlockchain,
+    #[cfg(feature = "test-electrum")]
+    ElectrumBlockchain,
 }
 
 #[cfg(test)]
@@ -377,6 +379,8 @@ pub mod test {
     use crate::blockchain::EsploraBlockchain;
     #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
     use crate::blockchain::{rpc::Auth, ConfigurableBlockchain, RpcBlockchain, RpcConfig};
+    #[cfg(feature = "test-electrum")]
+    use {crate::blockchain::ElectrumBlockchain, electrum_client::client::Client as electrum_client};
     use crate::database::MemoryDatabase;
     use crate::testutils;
     use crate::testutils::blockchain_tests::TestClient;
@@ -455,7 +459,7 @@ pub mod test {
                     skip_blocks: None,
                 };
                 AnyBlockchain::Rpc(Box::new(RpcBlockchain::from_config(&config).unwrap()))
-            }
+            },
 
             #[cfg(feature = "test-esplora")]
             BlockchainType::EsploraBlockchain => {
@@ -466,6 +470,13 @@ pub mod test {
                     ),
                     20,
                 )))
+            },
+
+            #[cfg(feature = "test-electrum")]
+            BlockchainType::ElectrumBlockchain => {
+                AnyBlockchain::Electrum(Box::new(ElectrumBlockchain::from(
+                    electrum_client::new(&test_client.electrsd.electrum_url).unwrap())
+                ))
             }
         };
         let wallet = get_wallet_from_descriptors(&descriptors);
@@ -530,6 +541,136 @@ pub mod test {
             "incorrect confirmation time"
         );
     }
+
+    #[cfg(not(feature = "test-rpc-legacy"))]
+    pub fn test_taproot_key_spend(chain_type: BlockchainType) {
+        use crate::blockchain::Blockchain;
+
+        let (wallet, blockchain, descriptors, mut test_client) = init_wallet(WalletType::TaprootKeySpend, chain_type);
+
+        let _ = test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 50_000);
+
+        let tx = {
+            let mut builder = wallet.build_tx();
+            builder.add_recipient(test_client.get_node_address(None).script_pubkey(), 25_000);
+            let (mut psbt, _details) = builder.finish().unwrap();
+            wallet.sign(&mut psbt, Default::default()).unwrap();
+            psbt.extract_tx()
+        };
+        blockchain.broadcast(&tx).unwrap();
+    }
+
+    #[cfg(not(feature = "test-rpc-legacy"))]
+    pub fn test_taproot_script_spend(chain_type: BlockchainType) {
+        use crate::blockchain::Blockchain;
+
+        let (wallet, blockchain, descriptors, mut test_client) = init_wallet(WalletType::TaprootScriptSpend, chain_type);
+
+        let _ = test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 ) ( @confirmations 6 )
+        });
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 50_000);
+
+        let ext_policy = wallet.policies(KeychainKind::External).unwrap().unwrap();
+        let int_policy = wallet.policies(KeychainKind::Internal).unwrap().unwrap();
+
+        let ext_path = vec![(ext_policy.id.clone(), vec![1])].into_iter().collect();
+        let int_path = vec![(int_policy.id.clone(), vec![1])].into_iter().collect();
+
+        let tx = {
+            let mut builder = wallet.build_tx();
+            builder.add_recipient(test_client.get_node_address(None).script_pubkey(), 25_000)
+                .policy_path(ext_path, KeychainKind::External)
+                .policy_path(int_path, KeychainKind::Internal);
+            let (mut psbt, _details) = builder.finish().unwrap();
+            wallet.sign(&mut psbt, Default::default()).unwrap();
+            psbt.extract_tx()
+        };
+        blockchain.broadcast(&tx).unwrap();
+    }
+
+    #[cfg(not(feature = "test-rpc-legacy"))]
+    pub fn test_sign_taproot_core_keyspend_psbt(chain_type: BlockchainType) {
+        test_sign_taproot_core_psbt(WalletType::TaprootKeySpend, chain_type);
+    }
+
+    #[cfg(not(feature = "test-rpc-legacy"))]
+    pub fn test_sign_taproot_core_scriptspend2_psbt(chain_type: BlockchainType) {
+        test_sign_taproot_core_psbt(WalletType::TaprootScriptSpend2, chain_type);
+    }
+
+    #[cfg(not(feature = "test-rpc-legacy"))]
+    pub fn test_sign_taproot_core_scriptspend3_psbt(chain_type: BlockchainType) {
+        test_sign_taproot_core_psbt(WalletType::TaprootScriptSpend3, chain_type);
+    }
+
+    #[cfg(not(feature = "test-rpc-legacy"))]
+    fn test_sign_taproot_core_psbt(wallet_type: WalletType, chain_type: BlockchainType) {
+        use std::str::FromStr;
+        use serde_json;
+        use bitcoincore_rpc::jsonrpc::serde_json::Value;
+        use bitcoincore_rpc::{Auth, Client};
+
+        let (wallet, _blockchain, _descriptors, test_client) = init_wallet(wallet_type, chain_type);
+
+        // TODO replace once rust-bitcoincore-rpc with PR 174 released
+        // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/pull/174
+        let _createwallet_result: Value = test_client.bitcoind.client.call("createwallet", &["taproot_wallet".into(), true.into(), true.into(), serde_json::to_value("").unwrap(), false.into(), true.into(), true.into(), false.into()]).expect("created wallet");
+
+        let external_descriptor = wallet.get_descriptor_for_keychain(KeychainKind::External);
+
+        // TODO replace once bitcoind released with support for rust-bitcoincore-rpc PR 174
+        let taproot_wallet_client = Client::new(&test_client.bitcoind.rpc_url_with_wallet("taproot_wallet"), Auth::CookieFile(test_client.bitcoind.params.cookie_file.clone())).unwrap();
+
+        let descriptor_info = taproot_wallet_client.get_descriptor_info(external_descriptor.to_string().as_str()).expect("descriptor info");
+
+        let import_descriptor_args = json!([{
+            "desc": descriptor_info.descriptor,
+            "active": true,
+            "timestamp": "now",
+            "label":"taproot key spend",
+        }]);
+        let _importdescriptors_result: Value = taproot_wallet_client.call("importdescriptors", &[import_descriptor_args]).expect("import wallet");
+        let generate_to_address: bitcoin::Address = taproot_wallet_client.call("getnewaddress", &["test address".into(), "bech32m".into()]).expect("new address");
+        let _generatetoaddress_result = taproot_wallet_client.generate_to_address(101, &generate_to_address).expect("generated to address");
+        let send_to_address = wallet.get_address(crate::wallet::AddressIndex::New).unwrap().address.to_string();
+        let change_address = wallet.get_address(crate::wallet::AddressIndex::New).unwrap().address.to_string();
+        let send_addr_amounts = json!([{
+            send_to_address: "0.4321"
+        }]);
+        let send_options = json!({
+            "change_address": change_address,
+            "psbt": true,
+        });
+        let send_result: Value = taproot_wallet_client.call("send", &[send_addr_amounts, Value::Null, "unset".into(), Value::Null, send_options]).expect("send psbt");
+        let core_psbt = send_result["psbt"].as_str().expect("core psbt str");
+
+        use bitcoin::util::psbt::PartiallySignedTransaction;
+
+        // Test parsing core created PSBT
+        let mut psbt = PartiallySignedTransaction::from_str(&core_psbt).expect("core taproot psbt");
+
+        // Test signing core created PSBT
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert_eq!(finalized, true);
+
+        // Test with updated psbt
+        let update_result: Value = taproot_wallet_client.call("utxoupdatepsbt", &[core_psbt.into()]).expect("update psbt utxos");
+        let core_updated_psbt = update_result.as_str().expect("core updated psbt");
+
+        // Test parsing core created and updated PSBT
+        let mut psbt = PartiallySignedTransaction::from_str(&core_updated_psbt).expect("core taproot psbt");
+
+        // Test signing core created and updated PSBT
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert_eq!(finalized, true);
+    }
+
 }
 
 #[macro_export]

@@ -588,25 +588,6 @@ pub mod test {
         }
     }
 
-    pub fn get_blockchain(test_client: &TestClient) -> RpcBlockchain {
-        let config = RpcConfig {
-            url: test_client.bitcoind.rpc_url(),
-            auth: Auth::Cookie {
-                file: test_client.bitcoind.params.cookie_file.clone(),
-            },
-            network: Network::Regtest,
-            wallet_name: format!(
-                "client-wallet-test-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ),
-            skip_blocks: None,
-        };
-        RpcBlockchain::from_config(&config).unwrap()
-    }
-
     make_blockchain_tests![
         @type BlockchainType::RpcBlockchain,
         @tests (

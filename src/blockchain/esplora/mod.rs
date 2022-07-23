@@ -166,20 +166,16 @@ pub mod test {
     use crate::testutils::blockchain_tests::BlockchainType;
     use crate::testutils::blockchain_tests::TestClient;
 
-    pub fn get_blockchain(test_client: &TestClient) -> EsploraBlockchain {
-        EsploraBlockchain::new(
-            &format!(
-                "http://{}",
-                test_client.electrsd.esplora_url.as_ref().unwrap()
-            ),
-            20,
-        )
-    }
-
+    #[cfg(feature = "test-esplora")]
     make_blockchain_tests![
         @type BlockchainType::EsploraBlockchain,
         @tests (
-            test_sync_simple
+            test_sync_simple,
+            test_taproot_key_spend,
+            test_taproot_script_spend,
+            test_sign_taproot_core_keyspend_psbt,
+            test_sign_taproot_core_scriptspend2_psbt,
+            test_sign_taproot_core_scriptspend3_psbt,
         )
     ];
 

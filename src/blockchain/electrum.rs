@@ -327,7 +327,8 @@ mod test {
 
     use super::*;
     use crate::database::MemoryDatabase;
-    use crate::testutils::blockchain_tests::TestClient;
+    use crate::make_blockchain_tests;
+    use crate::testutils::blockchain_tests::{TestClient, BlockchainType};
     use crate::wallet::{AddressIndex, Wallet};
 
     crate::bdk_blockchain_tests! {
@@ -335,6 +336,18 @@ mod test {
             ElectrumBlockchain::from(Client::new(&test_client.electrsd.electrum_url).unwrap())
         }
     }
+
+    make_blockchain_tests![
+        @type BlockchainType::ElectrumBlockchain,
+        @tests (
+            test_sync_simple,
+            test_taproot_key_spend,
+            test_taproot_script_spend,
+            test_sign_taproot_core_keyspend_psbt,
+            test_sign_taproot_core_scriptspend2_psbt,
+            test_sign_taproot_core_scriptspend3_psbt,
+        )
+    ];
 
     fn get_factory() -> (TestClient, Arc<ElectrumBlockchain>) {
         let test_client = TestClient::default();
