@@ -39,9 +39,10 @@ pub fn populate_test_db(
             .input
             .iter()
             .map(|test_input| {
-                let mut txin = TxIn { previous_output: OutPoint {
-                    txid: test_input.txid,
-                    vout: test_input.vout,
+                let mut txin = TxIn {
+                    previous_output: OutPoint {
+                        txid: test_input.txid,
+                        vout: test_input.vout,
                     },
                     ..Default::default()
                 };

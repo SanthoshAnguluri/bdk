@@ -419,7 +419,6 @@ impl BatchDatabase for Tree {
     }
 }
 
-
 #[cfg(test)]
 mod test {
     use lazy_static::lazy_static;

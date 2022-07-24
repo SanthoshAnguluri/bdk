@@ -374,20 +374,23 @@ pub enum BlockchainType {
 pub mod test {
     use std::any::Any;
 
+    use super::*;
     use crate::bitcoin::{Network, Transaction};
     #[cfg(feature = "test-esplora")]
     use crate::blockchain::EsploraBlockchain;
+    use crate::blockchain::{self, Blockchain};
     #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
     use crate::blockchain::{rpc::Auth, ConfigurableBlockchain, RpcBlockchain, RpcConfig};
-    #[cfg(feature = "test-electrum")]
-    use {crate::blockchain::ElectrumBlockchain, electrum_client::client::Client as electrum_client};
     use crate::database::MemoryDatabase;
-    use crate::testutils;
     use crate::testutils::blockchain_tests::TestClient;
     use crate::types::KeychainKind;
+    use crate::wallet::AddressIndex;
+    use crate::{testutils, wallet};
     use crate::{FeeRate, SyncOptions, Wallet};
-
-    use super::*;
+    #[cfg(feature = "test-electrum")]
+    use {
+        crate::blockchain::ElectrumBlockchain, electrum_client::client::Client as electrum_client,
+    };
 
     fn get_wallet_from_descriptors(
         descriptors: &(String, Option<String>),
@@ -459,7 +462,7 @@ pub mod test {
                     skip_blocks: None,
                 };
                 AnyBlockchain::Rpc(Box::new(RpcBlockchain::from_config(&config).unwrap()))
-            },
+            }
 
             #[cfg(feature = "test-esplora")]
             BlockchainType::EsploraBlockchain => {
@@ -470,13 +473,13 @@ pub mod test {
                     ),
                     20,
                 )))
-            },
+            }
 
             #[cfg(feature = "test-electrum")]
             BlockchainType::ElectrumBlockchain => {
                 AnyBlockchain::Electrum(Box::new(ElectrumBlockchain::from(
-                    electrum_client::new(&test_client.electrsd.electrum_url).unwrap())
-                ))
+                    electrum_client::new(&test_client.electrsd.electrum_url).unwrap(),
+                )))
             }
         };
         let wallet = get_wallet_from_descriptors(&descriptors);
@@ -486,6 +489,49 @@ pub mod test {
         wallet.sync(&blockchain, SyncOptions::default()).unwrap();
 
         (wallet, blockchain, descriptors, test_client)
+    }
+
+    fn get_blockchain(test_client: &TestClient, chain_type: BlockchainType) -> AnyBlockchain {
+        let blockchain: AnyBlockchain = match chain_type {
+            #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
+            BlockchainType::RpcBlockchain => {
+                let config = RpcConfig {
+                    url: test_client.bitcoind.rpc_url(),
+                    auth: Auth::Cookie {
+                        file: test_client.bitcoind.params.cookie_file.clone(),
+                    },
+                    network: Network::Regtest,
+                    wallet_name: format!(
+                        "client-wallet-test-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos()
+                    ),
+                    skip_blocks: None,
+                };
+                AnyBlockchain::Rpc(Box::new(RpcBlockchain::from_config(&config).unwrap()))
+            }
+
+            #[cfg(feature = "test-esplora")]
+            BlockchainType::EsploraBlockchain => {
+                AnyBlockchain::Esplora(Box::new(EsploraBlockchain::new(
+                    &format!(
+                        "http://{}",
+                        test_client.electrsd.esplora_url.as_ref().unwrap()
+                    ),
+                    20,
+                )))
+            }
+
+            #[cfg(feature = "test-electrum")]
+            BlockchainType::ElectrumBlockchain => {
+                AnyBlockchain::Electrum(Box::new(ElectrumBlockchain::from(
+                    electrum_client::new(&test_client.electrsd.electrum_url).unwrap(),
+                )))
+            }
+        };
+        blockchain
     }
 
     fn init_single_sig(
@@ -542,11 +588,1064 @@ pub mod test {
         );
     }
 
+    pub fn test_sync_stop_gap_20(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 5) => 50_000 )
+        });
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 25) => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        assert_eq!(wallet.get_balance().unwrap(), 100_000, "incorrect balance");
+        assert_eq!(
+            wallet.list_transactions(false).unwrap().len(),
+            2,
+            "incorrect number of txs"
+        );
+    }
+
+    pub fn test_sync_before_and_after_receive(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 0);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+        assert_eq!(
+            wallet.list_transactions(false).unwrap().len(),
+            1,
+            "incorrect number of txs"
+        );
+    }
+
+    pub fn test_sync_multiple_outputs_same_tx(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+
+        let txid = test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000, (@external descriptors, 1) => 25_000, (@external descriptors, 5) => 30_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        assert_eq!(wallet.get_balance().unwrap(), 105_000, "incorrect balance");
+        assert_eq!(
+            wallet.list_transactions(false).unwrap().len(),
+            1,
+            "incorrect number of txs"
+        );
+        assert_eq!(
+            wallet.list_unspent().unwrap().len(),
+            3,
+            "incorrect number of unspents"
+        );
+
+        let list_tx_item = &wallet.list_transactions(false).unwrap()[0];
+        assert_eq!(list_tx_item.txid, txid, "incorrect txid");
+        assert_eq!(list_tx_item.received, 105_000, "incorrect received");
+        assert_eq!(list_tx_item.sent, 0, "incorrect sent");
+        assert_eq!(
+            list_tx_item.confirmation_time, None,
+            "incorrect confirmation_time"
+        );
+    }
+
+    pub fn test_sync_receive_multi(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 5) => 25_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        assert_eq!(wallet.get_balance().unwrap(), 75_000, "incorrect balance");
+        assert_eq!(
+            wallet.list_transactions(false).unwrap().len(),
+            2,
+            "incorrect number of txs"
+        );
+        assert_eq!(
+            wallet.list_unspent().unwrap().len(),
+            2,
+            "incorrect number of unspent"
+        );
+    }
+
+    pub fn test_sync_address_reuse(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 50_000);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 25_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 75_000, "incorrect balance");
+    }
+
+    pub fn test_sync_receive_rbf_replaced(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+
+        let txid = test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 ) ( @replaceable true )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+        assert_eq!(
+            wallet.list_transactions(false).unwrap().len(),
+            1,
+            "incorrect number of txs"
+        );
+        assert_eq!(wallet.list_unspent().unwrap().len(), 1, "incorrect unspent");
+
+        let list_tx_item = &wallet.list_transactions(false).unwrap()[0];
+        assert_eq!(list_tx_item.txid, txid, "incorrect txid");
+        assert_eq!(list_tx_item.received, 50_000, "incorrect received");
+        assert_eq!(list_tx_item.sent, 0, "incorrect sent");
+        assert_eq!(
+            list_tx_item.confirmation_time, None,
+            "incorrect confirmation_time"
+        );
+
+        let new_txid = test_client.bump_fee(&txid);
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            50_000,
+            "incorrect balance after bump"
+        );
+        assert_eq!(
+            wallet.list_transactions(false).unwrap().len(),
+            1,
+            "incorrect number of txs after bump"
+        );
+        assert_eq!(
+            wallet.list_unspent().unwrap().len(),
+            1,
+            "incorrect unspent after bump"
+        );
+
+        let list_tx_item = &wallet.list_transactions(false).unwrap()[0];
+        assert_eq!(list_tx_item.txid, new_txid, "incorrect txid after bump");
+        assert_eq!(
+            list_tx_item.received, 50_000,
+            "incorrect received after bump"
+        );
+        assert_eq!(list_tx_item.sent, 0, "incorrect sent after bump");
+        assert_eq!(
+            list_tx_item.confirmation_time, None,
+            "incorrect height after bump"
+        );
+    }
+
+    // FIXME: I would like this to be cfg_attr(not(feature = "test-esplora"), ignore) but it
+    // doesn't work for some reason.
+    #[cfg(not(feature = "esplora"))]
+    pub fn test_sync_reorg_block(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+
+        let txid = test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 ) ( @confirmations 1 ) ( @replaceable true )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+        assert_eq!(
+            wallet.list_transactions(false).unwrap().len(),
+            1,
+            "incorrect number of txs"
+        );
+        assert_eq!(
+            wallet.list_unspent().unwrap().len(),
+            1,
+            "incorrect number of unspents"
+        );
+
+        let list_tx_item = &wallet.list_transactions(false).unwrap()[0];
+        assert_eq!(list_tx_item.txid, txid, "incorrect txid");
+        assert!(
+            list_tx_item.confirmation_time.is_some(),
+            "incorrect confirmation_time"
+        );
+
+        // Invalidate 1 block
+        test_client.invalidate(1);
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            50_000,
+            "incorrect balance after invalidate"
+        );
+
+        let list_tx_item = &wallet.list_transactions(false).unwrap()[0];
+        assert_eq!(list_tx_item.txid, txid, "incorrect txid after invalidate");
+        assert_eq!(
+            list_tx_item.confirmation_time, None,
+            "incorrect confirmation time after invalidate"
+        );
+    }
+
+    pub fn test_sync_after_send(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        println!("{}", descriptors.0);
+        let node_addr = test_client.get_node_address(None);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(node_addr.script_pubkey(), 25_000);
+        let (mut psbt, details) = builder.finish().unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        let tx = psbt.extract_tx();
+        println!("{}", bitcoin::consensus::encode::serialize_hex(&tx));
+        blockchain.broadcast(&tx).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            details.received,
+            "incorrect balance after send"
+        );
+
+        assert_eq!(
+            wallet.list_transactions(false).unwrap().len(),
+            2,
+            "incorrect number of txs"
+        );
+        assert_eq!(
+            wallet.list_unspent().unwrap().len(),
+            1,
+            "incorrect number of unspents"
+        );
+    }
+
+    /// Send two conflicting transactions to the same address twice in a row.
+    /// The coins should only be received once!
+    pub fn test_sync_double_receive(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        let receiver_wallet = get_wallet_from_descriptors(&(
+            "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)".to_string(),
+            None,
+        ));
+        // need to sync so rpc can start watching
+        receiver_wallet
+            .sync(&blockchain, SyncOptions::default())
+            .unwrap();
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000, (@external descriptors, 1) => 25_000 ) (@confirmations 1)
+        });
+
+        wallet
+            .sync(&blockchain, SyncOptions::default())
+            .expect("sync");
+        assert_eq!(wallet.get_balance().unwrap(), 75_000, "incorrect balance");
+        let target_addr = receiver_wallet
+            .get_address(wallet::AddressIndex::New)
+            .unwrap()
+            .address;
+
+        let tx1 = {
+            let mut builder = wallet.build_tx();
+            builder
+                .add_recipient(target_addr.script_pubkey(), 49_000)
+                .enable_rbf();
+            let (mut psbt, _details) = builder.finish().expect("building first tx");
+            let finalized = wallet
+                .sign(&mut psbt, Default::default())
+                .expect("signing first tx");
+            assert!(finalized, "Cannot finalize transaction");
+            psbt.extract_tx()
+        };
+
+        let tx2 = {
+            let mut builder = wallet.build_tx();
+            builder
+                .add_recipient(target_addr.script_pubkey(), 49_000)
+                .enable_rbf()
+                .fee_rate(FeeRate::from_sat_per_vb(5.0));
+            let (mut psbt, _details) = builder.finish().expect("building replacement tx");
+            let finalized = wallet
+                .sign(&mut psbt, Default::default())
+                .expect("signing replacement tx");
+            assert!(finalized, "Cannot finalize transaction");
+            psbt.extract_tx()
+        };
+
+        blockchain.broadcast(&tx1).expect("broadcasting first");
+        blockchain
+            .broadcast(&tx2)
+            .expect("broadcasting replacement");
+
+        receiver_wallet
+            .sync(&blockchain, SyncOptions::default())
+            .expect("syncing receiver");
+        assert_eq!(
+            receiver_wallet.get_balance().expect("balance"),
+            49_000,
+            "should have received coins once and only once"
+        );
+    }
+
+    pub fn test_sync_many_sends_to_a_single_address(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+
+        for _ in 0..4 {
+            // split this up into multiple blocks so rpc doesn't get angry
+            for _ in 0..20 {
+                test_client.receive(testutils! {
+                    @tx ( (@external descriptors, 0) => 1_000 )
+                });
+            }
+            test_client.generate(1, None);
+        }
+
+        // add some to the mempool as well.
+        for _ in 0..20 {
+            test_client.receive(testutils! {
+                @tx ( (@external descriptors, 0) => 1_000 )
+            });
+        }
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        assert_eq!(wallet.get_balance().unwrap(), 100_000);
+    }
+
+    pub fn test_update_confirmation_time_after_generate(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        println!("{}", descriptors.0);
+        let node_addr = test_client.get_node_address(None);
+
+        let received_txid = test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+
+        let tx_map = wallet
+            .list_transactions(false)
+            .unwrap()
+            .into_iter()
+            .map(|tx| (tx.txid, tx))
+            .collect::<std::collections::HashMap<_, _>>();
+        let details = tx_map.get(&received_txid).unwrap();
+        assert!(details.confirmation_time.is_none());
+
+        test_client.generate(1, Some(node_addr));
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        let tx_map = wallet
+            .list_transactions(false)
+            .unwrap()
+            .into_iter()
+            .map(|tx| (tx.txid, tx))
+            .collect::<std::collections::HashMap<_, _>>();
+        let details = tx_map.get(&received_txid).unwrap();
+        assert!(details.confirmation_time.is_some());
+    }
+
+    pub fn test_sync_outgoing_from_scratch(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        let node_addr = test_client.get_node_address(None);
+        let received_txid = test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(node_addr.script_pubkey(), 25_000);
+        let (mut psbt, details) = builder.finish().unwrap();
+
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        let sent_tx = psbt.extract_tx();
+        blockchain.broadcast(&sent_tx).unwrap();
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            details.received,
+            "incorrect balance after receive"
+        );
+
+        // empty wallet
+        let wallet = get_wallet_from_descriptors(&descriptors);
+
+        #[cfg(feature = "rpc")] // rpc cannot see mempool tx before importmulti
+        test_client.generate(1, Some(node_addr));
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        let tx_map = wallet
+            .list_transactions(false)
+            .unwrap()
+            .into_iter()
+            .map(|tx| (tx.txid, tx))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let received = tx_map.get(&received_txid).unwrap();
+        assert_eq!(
+            received.received, 50_000,
+            "incorrect received from receiver"
+        );
+        assert_eq!(received.sent, 0, "incorrect sent from receiver");
+
+        let sent = tx_map.get(&sent_tx.txid()).unwrap();
+        assert_eq!(
+            sent.received, details.received,
+            "incorrect received from sender"
+        );
+        assert_eq!(sent.sent, details.sent, "incorrect sent from sender");
+        assert_eq!(
+            sent.fee.unwrap_or(0),
+            details.fee.unwrap_or(0),
+            "incorrect fees from sender"
+        );
+    }
+
+    pub fn test_sync_long_change_chain(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        let node_addr = test_client.get_node_address(None);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+
+        let mut total_sent = 0;
+        for _ in 0..5 {
+            let mut builder = wallet.build_tx();
+            builder.add_recipient(node_addr.script_pubkey(), 5_000);
+            let (mut psbt, details) = builder.finish().unwrap();
+            let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+            assert!(finalized, "Cannot finalize transaction");
+            blockchain.broadcast(&psbt.extract_tx()).unwrap();
+
+            wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+            total_sent += 5_000 + details.fee.unwrap_or(0);
+        }
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            50_000 - total_sent,
+            "incorrect balance after chain"
+        );
+
+        // empty wallet
+
+        let wallet = get_wallet_from_descriptors(&descriptors);
+
+        #[cfg(feature = "rpc")] // rpc cannot see mempool tx before importmulti
+        test_client.generate(1, Some(node_addr));
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            50_000 - total_sent,
+            "incorrect balance empty wallet"
+        );
+    }
+
+    pub fn test_sync_bump_fee_basic(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        let node_addr = test_client.get_node_address(None);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 ) (@confirmations 1)
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(node_addr.script_pubkey().clone(), 5_000)
+            .enable_rbf();
+        let (mut psbt, details) = builder.finish().unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        blockchain.broadcast(&psbt.extract_tx()).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            50_000 - details.fee.unwrap_or(0) - 5_000,
+            "incorrect balance from fees"
+        );
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            details.received,
+            "incorrect balance from received"
+        );
+
+        let mut builder = wallet.build_fee_bump(details.txid).unwrap();
+        builder.fee_rate(FeeRate::from_sat_per_vb(2.1));
+        let (mut new_psbt, new_details) = builder.finish().expect("fee bump tx");
+        let finalized = wallet.sign(&mut new_psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        blockchain.broadcast(&new_psbt.extract_tx()).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            50_000 - new_details.fee.unwrap_or(0) - 5_000,
+            "incorrect balance from fees after bump"
+        );
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            new_details.received,
+            "incorrect balance from received after bump"
+        );
+
+        assert!(
+            new_details.fee.unwrap_or(0) > details.fee.unwrap_or(0),
+            "incorrect fees"
+        );
+    }
+
+    pub fn test_sync_bump_fee_remove_change(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        let node_addr = test_client.get_node_address(None);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 ) (@confirmations 1)
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(node_addr.script_pubkey().clone(), 49_000)
+            .enable_rbf();
+        let (mut psbt, details) = builder.finish().unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        blockchain.broadcast(&psbt.extract_tx()).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            1_000 - details.fee.unwrap_or(0),
+            "incorrect balance after send"
+        );
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            details.received,
+            "incorrect received after send"
+        );
+
+        let mut builder = wallet.build_fee_bump(details.txid).unwrap();
+        builder.fee_rate(FeeRate::from_sat_per_vb(5.1));
+        let (mut new_psbt, new_details) = builder.finish().unwrap();
+        let finalized = wallet.sign(&mut new_psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        blockchain.broadcast(&new_psbt.extract_tx()).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            0,
+            "incorrect balance after change removal"
+        );
+        assert_eq!(
+            new_details.received, 0,
+            "incorrect received after change removal"
+        );
+
+        assert!(
+            new_details.fee.unwrap_or(0) > details.fee.unwrap_or(0),
+            "incorrect fees"
+        );
+    }
+
+    pub fn test_sync_bump_fee_add_input_simple(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        let node_addr = test_client.get_node_address(None);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000, (@external descriptors, 1) => 25_000 ) (@confirmations 1)
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 75_000, "incorrect balance");
+
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(node_addr.script_pubkey().clone(), 49_000)
+            .enable_rbf();
+        let (mut psbt, details) = builder.finish().unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        blockchain.broadcast(&psbt.extract_tx()).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            26_000 - details.fee.unwrap_or(0),
+            "incorrect balance after send"
+        );
+        assert_eq!(
+            details.received,
+            1_000 - details.fee.unwrap_or(0),
+            "incorrect received after send"
+        );
+
+        let mut builder = wallet.build_fee_bump(details.txid).unwrap();
+        builder.fee_rate(FeeRate::from_sat_per_vb(10.0));
+        let (mut new_psbt, new_details) = builder.finish().unwrap();
+        let finalized = wallet.sign(&mut new_psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        blockchain.broadcast(&new_psbt.extract_tx()).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(new_details.sent, 75_000, "incorrect sent");
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            new_details.received,
+            "incorrect balance after add input"
+        );
+    }
+
+    pub fn test_sync_bump_fee_add_input_no_change(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        let node_addr = test_client.get_node_address(None);
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000, (@external descriptors, 1) => 25_000 ) (@confirmations 1)
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 75_000, "incorrect balance");
+
+        let mut builder = wallet.build_tx();
+        builder
+            .add_recipient(node_addr.script_pubkey().clone(), 49_000)
+            .enable_rbf();
+        let (mut psbt, details) = builder.finish().unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        blockchain.broadcast(&psbt.extract_tx()).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            26_000 - details.fee.unwrap_or(0),
+            "incorrect balance after send"
+        );
+        assert_eq!(
+            details.received,
+            1_000 - details.fee.unwrap_or(0),
+            "incorrect received after send"
+        );
+
+        let mut builder = wallet.build_fee_bump(details.txid).unwrap();
+        builder.fee_rate(FeeRate::from_sat_per_vb(123.0));
+        let (mut new_psbt, new_details) = builder.finish().unwrap();
+        println!("{:#?}", new_details);
+
+        let finalized = wallet.sign(&mut new_psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        blockchain.broadcast(&new_psbt.extract_tx()).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(new_details.sent, 75_000, "incorrect sent");
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            0,
+            "incorrect balance after add input"
+        );
+        assert_eq!(
+            new_details.received, 0,
+            "incorrect received after add input"
+        );
+    }
+
+    pub fn test_add_data(chain_type: BlockchainType) {
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        let node_addr = test_client.get_node_address(None);
+        let _ = test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 50_000, "incorrect balance");
+
+        let mut builder = wallet.build_tx();
+        let data = [42u8; 80];
+        builder.add_data(&data);
+        let (mut psbt, details) = builder.finish().unwrap();
+
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        let tx = psbt.extract_tx();
+        let serialized_tx = bitcoin::consensus::encode::serialize(&tx);
+        assert!(
+            serialized_tx.windows(data.len()).any(|e| e == data),
+            "cannot find op_return data in transaction"
+        );
+        blockchain.broadcast(&tx).unwrap();
+        test_client.generate(1, Some(node_addr));
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            50_000 - details.fee.unwrap_or(0),
+            "incorrect balance after send"
+        );
+
+        let tx_map = wallet
+            .list_transactions(false)
+            .unwrap()
+            .into_iter()
+            .map(|tx| (tx.txid, tx))
+            .collect::<std::collections::HashMap<_, _>>();
+        let _ = tx_map.get(&tx.txid()).unwrap();
+    }
+
+    pub fn test_sync_receive_coinbase(chain_type: BlockchainType) {
+        let (wallet, blockchain, _, mut test_client) = init_single_sig(chain_type);
+
+        let wallet_addr = wallet
+            .get_address(wallet::AddressIndex::New)
+            .unwrap()
+            .address;
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(wallet.get_balance().unwrap(), 0, "incorrect balance");
+
+        test_client.generate(1, Some(wallet_addr));
+
+        #[cfg(feature = "rpc")]
+        {
+            // rpc consider coinbase only when mature (100 blocks)
+            let node_addr = test_client.get_node_address(None);
+            test_client.generate(100, Some(node_addr));
+        }
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert!(
+            wallet.get_balance().unwrap() > 0,
+            "incorrect balance after receiving coinbase"
+        );
+    }
+
+    #[cfg(not(feature = "test-rpc-legacy"))]
+    pub fn test_send_to_bech32m_addr(chain_type: BlockchainType) {
+        use bitcoincore_rpc::jsonrpc::serde_json::Value;
+        use bitcoincore_rpc::{Auth, Client, RpcApi};
+        use serde;
+        use serde::Serialize;
+        use serde_json;
+        use std::str::FromStr;
+
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+
+        // TODO remove once rust-bitcoincore-rpc with PR 199 released
+        // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/pull/199
+        /// Import Descriptor Request
+        #[derive(Serialize, Clone, PartialEq, Eq, Debug)]
+        pub struct ImportDescriptorRequest {
+            pub active: bool,
+            #[serde(rename = "desc")]
+            pub descriptor: String,
+            pub range: [i64; 2],
+            pub next_index: i64,
+            pub timestamp: String,
+            pub internal: bool,
+        }
+
+        // TODO remove once rust-bitcoincore-rpc with PR 199 released
+        impl ImportDescriptorRequest {
+            /// Create a new Import Descriptor request providing just the descriptor and internal flags
+            pub fn new(descriptor: &str, internal: bool) -> Self {
+                ImportDescriptorRequest {
+                    descriptor: descriptor.to_string(),
+                    internal,
+                    active: true,
+                    range: [0, 100],
+                    next_index: 0,
+                    timestamp: "now".to_string(),
+                }
+            }
+        }
+
+        // 1. Create and add descriptors to a test bitcoind node taproot wallet
+
+        // TODO replace once rust-bitcoincore-rpc with PR 174 released
+        // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/pull/174
+        let _createwallet_result: Value = test_client
+            .bitcoind
+            .client
+            .call(
+                "createwallet",
+                &[
+                    "taproot_wallet".into(),
+                    false.into(),
+                    true.into(),
+                    serde_json::to_value("").unwrap(),
+                    false.into(),
+                    true.into(),
+                ],
+            )
+            .unwrap();
+
+        // TODO replace once bitcoind released with support for rust-bitcoincore-rpc PR 174
+        let taproot_wallet_client = Client::new(
+            &test_client.bitcoind.rpc_url_with_wallet("taproot_wallet"),
+            Auth::CookieFile(test_client.bitcoind.params.cookie_file.clone()),
+        )
+        .unwrap();
+
+        let wallet_descriptor = "tr(tprv8ZgxMBicQKsPdBtxmEMPnNq58KGusNAimQirKFHqX2yk2D8q1v6pNLiKYVAdzDHy2w3vF4chuGfMvNtzsbTTLVXBcdkCA1rje1JG6oksWv8/86h/1h/0h/0/*)#y283ssmn";
+        let change_descriptor = "tr(tprv8ZgxMBicQKsPdBtxmEMPnNq58KGusNAimQirKFHqX2yk2D8q1v6pNLiKYVAdzDHy2w3vF4chuGfMvNtzsbTTLVXBcdkCA1rje1JG6oksWv8/86h/1h/0h/1/*)#47zsd9tt";
+
+        let tr_descriptors = vec![
+            ImportDescriptorRequest::new(wallet_descriptor, false),
+            ImportDescriptorRequest::new(change_descriptor, false),
+        ];
+
+        // TODO replace once rust-bitcoincore-rpc with PR 199 released
+        let _import_result: Value = taproot_wallet_client
+            .call(
+                "importdescriptors",
+                &[serde_json::to_value(tr_descriptors).unwrap()],
+            )
+            .unwrap();
+
+        // 2. Get a new bech32m address from test bitcoind node taproot wallet
+
+        // TODO replace once rust-bitcoincore-rpc with PR 199 released
+        let node_addr: bitcoin::Address = taproot_wallet_client
+            .call("getnewaddress", &["test address".into(), "bech32m".into()])
+            .unwrap();
+        assert_eq!(
+            node_addr,
+            bitcoin::Address::from_str(
+                "bcrt1pj5y3f0fu4y7g98k4v63j9n0xvj3lmln0cpwhsjzknm6nt0hr0q7qnzwsy9"
+            )
+            .unwrap()
+        );
+
+        // 3. Send 50_000 sats from test bitcoind node to test BDK wallet
+
+        test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            50_000,
+            "wallet has incorrect balance"
+        );
+
+        // 4. Send 25_000 sats from test BDK wallet to test bitcoind node taproot wallet
+
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(node_addr.script_pubkey(), 25_000);
+        let (mut psbt, details) = builder.finish().unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert!(finalized, "wallet cannot finalize transaction");
+        let tx = psbt.extract_tx();
+        blockchain.broadcast(&tx).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        assert_eq!(
+            wallet.get_balance().unwrap(),
+            details.received,
+            "wallet has incorrect balance after send"
+        );
+        assert_eq!(
+            wallet.list_transactions(false).unwrap().len(),
+            2,
+            "wallet has incorrect number of txs"
+        );
+        assert_eq!(
+            wallet.list_unspent().unwrap().len(),
+            1,
+            "wallet has incorrect number of unspents"
+        );
+        test_client.generate(1, None);
+
+        // 5. Verify 25_000 sats are received by test bitcoind node taproot wallet
+
+        let taproot_balance = taproot_wallet_client.get_balance(None, None).unwrap();
+        assert_eq!(
+            taproot_balance.as_sat(),
+            25_000,
+            "node has incorrect taproot wallet balance"
+        );
+    }
+
+    pub fn test_tx_chain(chain_type: BlockchainType) {
+        use bitcoin::consensus::encode::deserialize;
+        use bitcoincore_rpc::RpcApi;
+        // use $crate::wallet::AddressIndex;
+
+        // Here we want to test that we set correctly the send and receive
+        // fields in the transaction object. For doing so, we create two
+        // different txs, the second one spending from the first:
+        // 1.
+        // Core (#1) -> Core (#2)
+        //           -> Us   (#3)
+        // 2.
+        // Core (#2) -> Us   (#4)
+
+        let (wallet, blockchain, _, mut test_client) = init_single_sig(chain_type);
+        let bdk_address = wallet.get_address(AddressIndex::New).unwrap().address;
+        let core_address = test_client.get_new_address(None, None).unwrap();
+        let tx = testutils! {
+            @tx ( (@addr bdk_address.clone()) => 50_000, (@addr core_address.clone()) => 40_000 )
+        };
+
+        // Tx one: from Core #1 to Core #2 and Us #3.
+        let txid_1 = test_client.receive(tx);
+        let tx_1: Transaction =
+            deserialize(&test_client.get_transaction(&txid_1, None).unwrap().hex).unwrap();
+        let vout_1 = tx_1
+            .output
+            .into_iter()
+            .position(|o| o.script_pubkey == core_address.script_pubkey())
+            .unwrap() as u32;
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        let tx_1 = wallet
+            .list_transactions(false)
+            .unwrap()
+            .into_iter()
+            .find(|tx| tx.txid == txid_1)
+            .unwrap();
+        assert_eq!(tx_1.received, 50_000);
+        assert_eq!(tx_1.sent, 0);
+
+        // Tx two: from Core #2 to Us #4.
+        let tx = testutils! {
+            @tx ( (@addr bdk_address) => 10_000 ) ( @inputs (txid_1,vout_1))
+        };
+        let txid_2 = test_client.receive(tx);
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        let tx_2 = wallet
+            .list_transactions(false)
+            .unwrap()
+            .into_iter()
+            .find(|tx| tx.txid == txid_2)
+            .unwrap();
+        assert_eq!(tx_2.received, 10_000);
+        assert_eq!(tx_2.sent, 0);
+    }
+
+    pub fn test_double_spend(chain_type: BlockchainType) {
+        // We create a tx and then we try to double spend it; BDK will always allow
+        // us to do so, as it never forgets about spent UTXOs
+        let (wallet, blockchain, descriptors, mut test_client) = init_single_sig(chain_type);
+        let node_addr = test_client.get_node_address(None);
+        let _ = test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0) => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(node_addr.script_pubkey(), 25_000);
+        let (mut psbt, _details) = builder.finish().unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
+        assert!(finalized, "Cannot finalize transaction");
+        let initial_tx = psbt.extract_tx();
+        let _sent_txid = blockchain.broadcast(&initial_tx).unwrap();
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        for utxo in wallet.list_unspent().unwrap() {
+            // Making sure the TXO we just spent is not returned by list_unspent
+            assert!(
+                utxo.outpoint != initial_tx.input[0].previous_output,
+                "wallet displays spent txo in unspents"
+            );
+        }
+        // We can still create a transaction double spending `initial_tx`
+        let mut builder = wallet.build_tx();
+        builder
+            .add_utxo(initial_tx.input[0].previous_output)
+            .expect("Can't manually add an UTXO spent");
+        test_client.generate(1, Some(node_addr));
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+        // Even after confirmation, we can still create a tx double spend it
+        let mut builder = wallet.build_tx();
+        builder
+            .add_utxo(initial_tx.input[0].previous_output)
+            .expect("Can't manually add an UTXO spent");
+        for utxo in wallet.list_unspent().unwrap() {
+            // Making sure the TXO we just spent is not returned by list_unspent
+            assert!(
+                utxo.outpoint != initial_tx.input[0].previous_output,
+                "wallet displays spent txo in unspents"
+            );
+        }
+    }
+
+    pub fn test_send_receive_pkh(chain_type: BlockchainType) {
+        let descriptors = (
+            "pkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)".to_string(),
+            None,
+        );
+        let mut test_client = TestClient::default();
+        let blockchain = get_blockchain(&test_client, chain_type);
+        let wallet = get_wallet_from_descriptors(&descriptors);
+        #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        let _ = test_client.receive(testutils! {
+            @tx ( (@external descriptors, 0)   => 50_000 )
+        });
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+
+        assert_eq!(wallet.get_balance().unwrap(), 50_000);
+
+        let tx = {
+            let mut builder = wallet.build_tx();
+            builder.add_recipient(test_client.get_node_address(None).script_pubkey(), 25_000);
+            let (mut psbt, _details) = builder.finish().unwrap();
+            wallet.sign(&mut psbt, Default::default()).unwrap();
+            psbt.extract_tx()
+        };
+        blockchain.broadcast(&tx).unwrap();
+
+        wallet.sync(&blockchain, SyncOptions::default()).unwrap();
+    }
+
     #[cfg(not(feature = "test-rpc-legacy"))]
     pub fn test_taproot_key_spend(chain_type: BlockchainType) {
         use crate::blockchain::Blockchain;
 
-        let (wallet, blockchain, descriptors, mut test_client) = init_wallet(WalletType::TaprootKeySpend, chain_type);
+        let (wallet, blockchain, descriptors, mut test_client) =
+            init_wallet(WalletType::TaprootKeySpend, chain_type);
 
         let _ = test_client.receive(testutils! {
             @tx ( (@external descriptors, 0) => 50_000 )
@@ -568,7 +1667,8 @@ pub mod test {
     pub fn test_taproot_script_spend(chain_type: BlockchainType) {
         use crate::blockchain::Blockchain;
 
-        let (wallet, blockchain, descriptors, mut test_client) = init_wallet(WalletType::TaprootScriptSpend, chain_type);
+        let (wallet, blockchain, descriptors, mut test_client) =
+            init_wallet(WalletType::TaprootScriptSpend, chain_type);
 
         let _ = test_client.receive(testutils! {
             @tx ( (@external descriptors, 0) => 50_000 ) ( @confirmations 6 )
@@ -584,7 +1684,8 @@ pub mod test {
 
         let tx = {
             let mut builder = wallet.build_tx();
-            builder.add_recipient(test_client.get_node_address(None).script_pubkey(), 25_000)
+            builder
+                .add_recipient(test_client.get_node_address(None).script_pubkey(), 25_000)
                 .policy_path(ext_path, KeychainKind::External)
                 .policy_path(int_path, KeychainKind::Internal);
             let (mut psbt, _details) = builder.finish().unwrap();
@@ -611,23 +1712,45 @@ pub mod test {
 
     #[cfg(not(feature = "test-rpc-legacy"))]
     fn test_sign_taproot_core_psbt(wallet_type: WalletType, chain_type: BlockchainType) {
-        use std::str::FromStr;
-        use serde_json;
         use bitcoincore_rpc::jsonrpc::serde_json::Value;
         use bitcoincore_rpc::{Auth, Client};
+        use serde_json;
+        use std::str::FromStr;
 
         let (wallet, _blockchain, _descriptors, test_client) = init_wallet(wallet_type, chain_type);
 
         // TODO replace once rust-bitcoincore-rpc with PR 174 released
         // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/pull/174
-        let _createwallet_result: Value = test_client.bitcoind.client.call("createwallet", &["taproot_wallet".into(), true.into(), true.into(), serde_json::to_value("").unwrap(), false.into(), true.into(), true.into(), false.into()]).expect("created wallet");
+        let _createwallet_result: Value = test_client
+            .bitcoind
+            .client
+            .call(
+                "createwallet",
+                &[
+                    "taproot_wallet".into(),
+                    true.into(),
+                    true.into(),
+                    serde_json::to_value("").unwrap(),
+                    false.into(),
+                    true.into(),
+                    true.into(),
+                    false.into(),
+                ],
+            )
+            .expect("created wallet");
 
         let external_descriptor = wallet.get_descriptor_for_keychain(KeychainKind::External);
 
         // TODO replace once bitcoind released with support for rust-bitcoincore-rpc PR 174
-        let taproot_wallet_client = Client::new(&test_client.bitcoind.rpc_url_with_wallet("taproot_wallet"), Auth::CookieFile(test_client.bitcoind.params.cookie_file.clone())).unwrap();
+        let taproot_wallet_client = Client::new(
+            &test_client.bitcoind.rpc_url_with_wallet("taproot_wallet"),
+            Auth::CookieFile(test_client.bitcoind.params.cookie_file.clone()),
+        )
+        .unwrap();
 
-        let descriptor_info = taproot_wallet_client.get_descriptor_info(external_descriptor.to_string().as_str()).expect("descriptor info");
+        let descriptor_info = taproot_wallet_client
+            .get_descriptor_info(external_descriptor.to_string().as_str())
+            .expect("descriptor info");
 
         let import_descriptor_args = json!([{
             "desc": descriptor_info.descriptor,
@@ -635,11 +1758,25 @@ pub mod test {
             "timestamp": "now",
             "label":"taproot key spend",
         }]);
-        let _importdescriptors_result: Value = taproot_wallet_client.call("importdescriptors", &[import_descriptor_args]).expect("import wallet");
-        let generate_to_address: bitcoin::Address = taproot_wallet_client.call("getnewaddress", &["test address".into(), "bech32m".into()]).expect("new address");
-        let _generatetoaddress_result = taproot_wallet_client.generate_to_address(101, &generate_to_address).expect("generated to address");
-        let send_to_address = wallet.get_address(crate::wallet::AddressIndex::New).unwrap().address.to_string();
-        let change_address = wallet.get_address(crate::wallet::AddressIndex::New).unwrap().address.to_string();
+        let _importdescriptors_result: Value = taproot_wallet_client
+            .call("importdescriptors", &[import_descriptor_args])
+            .expect("import wallet");
+        let generate_to_address: bitcoin::Address = taproot_wallet_client
+            .call("getnewaddress", &["test address".into(), "bech32m".into()])
+            .expect("new address");
+        let _generatetoaddress_result = taproot_wallet_client
+            .generate_to_address(101, &generate_to_address)
+            .expect("generated to address");
+        let send_to_address = wallet
+            .get_address(crate::wallet::AddressIndex::New)
+            .unwrap()
+            .address
+            .to_string();
+        let change_address = wallet
+            .get_address(crate::wallet::AddressIndex::New)
+            .unwrap()
+            .address
+            .to_string();
         let send_addr_amounts = json!([{
             send_to_address: "0.4321"
         }]);
@@ -647,7 +1784,18 @@ pub mod test {
             "change_address": change_address,
             "psbt": true,
         });
-        let send_result: Value = taproot_wallet_client.call("send", &[send_addr_amounts, Value::Null, "unset".into(), Value::Null, send_options]).expect("send psbt");
+        let send_result: Value = taproot_wallet_client
+            .call(
+                "send",
+                &[
+                    send_addr_amounts,
+                    Value::Null,
+                    "unset".into(),
+                    Value::Null,
+                    send_options,
+                ],
+            )
+            .expect("send psbt");
         let core_psbt = send_result["psbt"].as_str().expect("core psbt str");
 
         use bitcoin::util::psbt::PartiallySignedTransaction;
@@ -660,19 +1808,20 @@ pub mod test {
         assert_eq!(finalized, true);
 
         // Test with updated psbt
-        let update_result: Value = taproot_wallet_client.call("utxoupdatepsbt", &[core_psbt.into()]).expect("update psbt utxos");
+        let update_result: Value = taproot_wallet_client
+            .call("utxoupdatepsbt", &[core_psbt.into()])
+            .expect("update psbt utxos");
         let core_updated_psbt = update_result.as_str().expect("core updated psbt");
 
         // Test parsing core created and updated PSBT
-        let mut psbt = PartiallySignedTransaction::from_str(&core_updated_psbt).expect("core taproot psbt");
+        let mut psbt =
+            PartiallySignedTransaction::from_str(&core_updated_psbt).expect("core taproot psbt");
 
         // Test signing core created and updated PSBT
         let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
         assert_eq!(finalized, true);
     }
-
 }
-
 #[macro_export]
 #[doc(hidden)]
 macro_rules! make_blockchain_tests {
