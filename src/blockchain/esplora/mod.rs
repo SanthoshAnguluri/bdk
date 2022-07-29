@@ -168,8 +168,8 @@ pub mod test {
 
     #[cfg(feature = "test-esplora")]
     make_blockchain_tests![
-        @type BlockchainType::EsploraBlockchain,
-        @tests (
+        blockchain BlockchainType::EsploraBlockchain,
+        tests (
             test_sync_simple,
             test_sync_stop_gap_20,
             test_sync_before_and_after_receive,
@@ -177,7 +177,6 @@ pub mod test {
             test_sync_receive_multi,
             test_sync_address_reuse,
             test_sync_receive_rbf_replaced,
-            test_sync_reorg_block,
             test_sync_after_send,
             test_sync_double_receive,
             test_sync_many_sends_to_a_single_address,

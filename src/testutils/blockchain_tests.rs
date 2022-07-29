@@ -413,6 +413,48 @@ pub mod test {
         TaprootScriptSpend3,
     }
 
+    fn get_blockchain(test_client: &TestClient, chain_type: BlockchainType) -> AnyBlockchain {
+        match chain_type {
+            #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
+            BlockchainType::RpcBlockchain => {
+                let config = RpcConfig {
+                    url: test_client.bitcoind.rpc_url(),
+                    auth: Auth::Cookie {
+                        file: test_client.bitcoind.params.cookie_file.clone(),
+                    },
+                    network: Network::Regtest,
+                    wallet_name: format!(
+                        "client-wallet-test-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos()
+                    ),
+                    skip_blocks: None,
+                };
+                AnyBlockchain::Rpc(Box::new(RpcBlockchain::from_config(&config).unwrap()))
+            }
+
+            #[cfg(feature = "test-esplora")]
+            BlockchainType::EsploraBlockchain => {
+                AnyBlockchain::Esplora(Box::new(EsploraBlockchain::new(
+                    &format!(
+                        "http://{}",
+                        test_client.electrsd.esplora_url.as_ref().unwrap()
+                    ),
+                    20,
+                )))
+            }
+
+            #[cfg(feature = "test-electrum")]
+            BlockchainType::ElectrumBlockchain => {
+                AnyBlockchain::Electrum(Box::new(ElectrumBlockchain::from(
+                    electrum_client::new(&test_client.electrsd.electrum_url).unwrap(),
+                )))
+            }
+        }
+    }
+
     fn init_wallet(
         ty: WalletType,
         chain_type: BlockchainType,
@@ -443,45 +485,7 @@ pub mod test {
         };
 
         let test_client = TestClient::default();
-        let blockchain: AnyBlockchain = match chain_type {
-            #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
-            BlockchainType::RpcBlockchain => {
-                let config = RpcConfig {
-                    url: test_client.bitcoind.rpc_url(),
-                    auth: Auth::Cookie {
-                        file: test_client.bitcoind.params.cookie_file.clone(),
-                    },
-                    network: Network::Regtest,
-                    wallet_name: format!(
-                        "client-wallet-test-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_nanos()
-                    ),
-                    skip_blocks: None,
-                };
-                AnyBlockchain::Rpc(Box::new(RpcBlockchain::from_config(&config).unwrap()))
-            }
-
-            #[cfg(feature = "test-esplora")]
-            BlockchainType::EsploraBlockchain => {
-                AnyBlockchain::Esplora(Box::new(EsploraBlockchain::new(
-                    &format!(
-                        "http://{}",
-                        test_client.electrsd.esplora_url.as_ref().unwrap()
-                    ),
-                    20,
-                )))
-            }
-
-            #[cfg(feature = "test-electrum")]
-            BlockchainType::ElectrumBlockchain => {
-                AnyBlockchain::Electrum(Box::new(ElectrumBlockchain::from(
-                    electrum_client::new(&test_client.electrsd.electrum_url).unwrap(),
-                )))
-            }
-        };
+        let blockchain: AnyBlockchain = get_blockchain(&test_client, chain_type);
         let wallet = get_wallet_from_descriptors(&descriptors);
 
         // rpc need to call import_multi before receiving any tx, otherwise will not see tx in the mempool
@@ -489,49 +493,6 @@ pub mod test {
         wallet.sync(&blockchain, SyncOptions::default()).unwrap();
 
         (wallet, blockchain, descriptors, test_client)
-    }
-
-    fn get_blockchain(test_client: &TestClient, chain_type: BlockchainType) -> AnyBlockchain {
-        let blockchain: AnyBlockchain = match chain_type {
-            #[cfg(any(feature = "test-rpc", feature = "test-rpc-legacy"))]
-            BlockchainType::RpcBlockchain => {
-                let config = RpcConfig {
-                    url: test_client.bitcoind.rpc_url(),
-                    auth: Auth::Cookie {
-                        file: test_client.bitcoind.params.cookie_file.clone(),
-                    },
-                    network: Network::Regtest,
-                    wallet_name: format!(
-                        "client-wallet-test-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_nanos()
-                    ),
-                    skip_blocks: None,
-                };
-                AnyBlockchain::Rpc(Box::new(RpcBlockchain::from_config(&config).unwrap()))
-            }
-
-            #[cfg(feature = "test-esplora")]
-            BlockchainType::EsploraBlockchain => {
-                AnyBlockchain::Esplora(Box::new(EsploraBlockchain::new(
-                    &format!(
-                        "http://{}",
-                        test_client.electrsd.esplora_url.as_ref().unwrap()
-                    ),
-                    20,
-                )))
-            }
-
-            #[cfg(feature = "test-electrum")]
-            BlockchainType::ElectrumBlockchain => {
-                AnyBlockchain::Electrum(Box::new(ElectrumBlockchain::from(
-                    electrum_client::new(&test_client.electrsd.electrum_url).unwrap(),
-                )))
-            }
-        };
-        blockchain
     }
 
     fn init_single_sig(
@@ -1822,10 +1783,11 @@ pub mod test {
         assert_eq!(finalized, true);
     }
 }
+
 #[macro_export]
 #[doc(hidden)]
 macro_rules! make_blockchain_tests {
-    (@type $chain_type:expr, @tests ( $($x:tt) , + $(,)? )) => {
+    (blockchain $chain_type:expr, tests ( $($x:tt) , + $(,)? )) => {
         $(
           #[test]
           fn $x()

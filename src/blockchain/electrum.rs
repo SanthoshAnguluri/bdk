@@ -338,8 +338,8 @@ mod test {
     }
 
     make_blockchain_tests![
-        @type BlockchainType::ElectrumBlockchain,
-        @tests (
+        blockchain BlockchainType::ElectrumBlockchain,
+        tests (
             test_sync_simple,
             test_sync_stop_gap_20,
             test_sync_before_and_after_receive,

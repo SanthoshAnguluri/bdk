@@ -589,8 +589,8 @@ pub mod test {
     }
 
     make_blockchain_tests![
-        @type BlockchainType::RpcBlockchain,
-        @tests (
+        blockchain BlockchainType::RpcBlockchain,
+        tests (
             test_sync_simple,
             test_sync_stop_gap_20,
             test_sync_before_and_after_receive,
@@ -608,9 +608,16 @@ pub mod test {
             test_sync_bump_fee_add_input_simple,
             test_sync_bump_fee_add_input_no_change,
             test_sync_receive_coinbase,
-            test_send_to_bech32m_addr,
             test_double_spend,
-            test_tx_chain,
+            test_tx_chain
+        )
+    ];
+
+    #[cfg(not(feature = "test-rpc-legacy"))]
+    make_blockchain_tests![
+        blockchain BlockchainType::RpcBlockchain,
+        tests (
+            test_send_to_bech32m_addr,
             test_taproot_key_spend,
             test_taproot_script_spend,
             test_sign_taproot_core_keyspend_psbt,
